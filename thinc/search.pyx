@@ -1,8 +1,10 @@
-# cython: profile=True
+from __future__ cimport division
 cimport cython
 from libc.string cimport memset, memcpy
 
 from cymem.cymem cimport Pool
+from preshed.maps cimport PreshMap
+from .typedefs cimport hash_t
 
 
 cdef class Beam:
@@ -12,8 +14,8 @@ cdef class Beam:
         self.nr_class = nr_class
         self.width = width
         self.size = 1
+        self.t = 0
         self.mem = Pool()
-        self.q = new Queue()
         self._parents = <_State*>self.mem.alloc(self.width, sizeof(_State))
         self._states = <_State*>self.mem.alloc(self.width, sizeof(_State))
         cdef int i
@@ -31,8 +33,13 @@ cdef class Beam:
     property score:
         def __get__(self):
             return self._states[0].score
+
+    property loss:
+        def __get__(self):
+            return self._states[0].loss
  
-    cdef int set_row(self, int i, weight_t* scores, bint* is_valid, int* costs) except -1:
+    cdef int set_row(self, int i, const weight_t* scores, const bint* is_valid,
+                     const int* costs) except -1:
         cdef int j
         for j in range(self.nr_class):
             self.scores[i][j] = scores[j]
@@ -52,12 +59,14 @@ cdef class Beam:
             self._parents[i].content = init_func(self.mem, n, extra_args)
 
     @cython.cdivision(True)
-    cdef int advance(self, trans_func_t transition_func, void* extra_args) except -1:
+    cdef int advance(self, trans_func_t transition_func, hash_func_t hash_func,
+                     void* extra_args) except -1:
         cdef weight_t** scores = self.scores
         cdef bint** is_valid = self.is_valid
         cdef int** costs = self.costs
 
-        self._fill(scores, is_valid)
+        cdef Queue* q = new Queue()
+        self._fill(q, scores, is_valid)
         # For a beam of width k, we only ever need 2k state objects. How?
         # Each transition takes a parent and a class and produces a new state.
         # So, we don't need the whole history --- just the parent. So at
@@ -71,12 +80,15 @@ cdef class Beam:
         cdef class_t clas
         cdef _State* parent
         cdef _State* state
-        while i < self.width and not self.q.empty():
-            data = self.q.top()
+        cdef hash_t key
+        cdef PreshMap seen_states = PreshMap(self.width)
+        cdef size_t is_seen
+        while i < self.width and not q.empty():
+            data = q.top()
             p_i = data.second / self.nr_class
             clas = data.second % self.nr_class
             score = data.first
-            self.q.pop()
+            q.pop()
             parent = &self._parents[p_i]
             # Indicates terminal state reached; i.e. state is done
             if parent.is_done:
@@ -84,22 +96,29 @@ cdef class Beam:
                 self._states[i] = parent[0]
                 self._states[i].score = score
                 i += 1
-                continue
-            state = &self._states[i]
-            # The supplied transition function should adjust the destination
-            # state to be the result of applying the class to the source state
-            transition_func(state.content, parent.content, clas, extra_args)
-            state.score = score
-            state.loss = parent.loss + costs[p_i][clas]
-            self.histories[i] = list(self._parent_histories[p_i])
-            self.histories[i].append(clas)
-            i += 1
+            else:
+                state = &self._states[i]
+                # The supplied transition function should adjust the destination
+                # state to be the result of applying the class to the source state
+                transition_func(state.content, parent.content, clas, extra_args)
+                key = hash_func(state.content, extra_args) if hash_func is not NULL else 0
+                is_seen = <size_t>seen_states.get(key)
+                if key == 0 or not is_seen:
+                    if key != 0:
+                        seen_states.set(key, <void*>1)
+                    state.score = score
+                    state.loss = parent.loss + costs[p_i][clas]
+                    self.histories[i] = list(self._parent_histories[p_i])
+                    self.histories[i].append(clas)
+                    i += 1
+        del q
         self.size = i
         assert self.size >= 1
         for i in range(self.width):
             memset(self.scores[i], 0, sizeof(weight_t) * self.nr_class)
             memset(self.is_valid[i], False, sizeof(bint) * self.nr_class)
             memset(self.costs[i], 0, sizeof(int) * self.nr_class)
+        self.t += 1
 
     cdef int check_done(self, finish_func_t finish_func, void* extra_args) except -1:
         cdef int i
@@ -112,14 +131,13 @@ cdef class Beam:
         else:
             self.is_done = True
 
-    cdef int _fill(self, weight_t** scores, bint** is_valid) except -1:
+    @cython.cdivision(True)
+    cdef int _fill(self, Queue* q, weight_t** scores, bint** is_valid) except -1:
         """Populate the queue from a k * n matrix of scores, where k is the
         beam-width, and n is the number of classes.
         """
         cdef Entry entry
         cdef weight_t score
-        del self.q
-        self.q = new Queue()
         cdef _State* s
         cdef int i, j, move_id
         assert self.size >= 1
@@ -129,17 +147,17 @@ cdef class Beam:
             if s.is_done:
                 # Update score by path average, following TACL '13 paper.
                 if self.histories[i]:
-                    entry.first = s.score + (s.score / len(self.histories[i]))
+                    entry.first = s.score + (s.score / self.t)
                 else:
                     entry.first = s.score
                 entry.second = move_id
-                self.q.push(entry)
-                continue
-            for j in range(self.nr_class):
-                if is_valid[i][j]:
-                    entry.first = s.score + scores[i][j]
-                    entry.second = move_id + j
-                    self.q.push(entry)
+                q.push(entry)
+            else:
+                for j in range(self.nr_class):
+                    if is_valid[i][j]:
+                        entry.first = s.score + scores[i][j]
+                        entry.second = move_id + j
+                        q.push(entry)
 
 
 cdef class MaxViolation:

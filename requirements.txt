@@ -1,7 +1,3 @@
-pytest
-cython
-cymem
-murmurhash
-preshed
-humanize
-ujson
+cymem == 1.30
+murmurhash == 0.24
+preshed == 0.43
