@@ -1,84 +1,177 @@
 #!/usr/bin/env python
-import subprocess
-from setuptools import setup
-from glob import glob
-
-import sys
+from __future__ import print_function
 import os
-from os import path
-from os.path import splitext
+import subprocess
+import sys
+import contextlib
+from distutils.command.build_ext import build_ext
+from distutils.sysconfig import get_python_inc
+from distutils import ccompiler, msvccompiler
+
+try:
+    from setuptools import Extension, setup
+except ImportError:
+    from distutils.core import Extension, setup
 
 
-from setuptools import Extension
+PACKAGES = [
+    'thinc',
+    'thinc.linear',
+    'thinc.extra',
+    'thinc.neural',
+    'thinc.linear.tests',
+    'thinc.extra.tests',
+    'thinc.neural.tests'
+]
 
 
-def clean(ext):
-    for src in ext.sources:
-        if src.endswith('.c') or src.endswith('cpp'):
-            so = src.rsplit('.', 1)[0] + '.so'
-            html = src.rsplit('.', 1)[0] + '.html'
-            if os.path.exists(so):
-                os.unlink(so)
-            if os.path.exists(html):
-                os.unlink(html)
+MOD_NAMES = [
+    'thinc.linalg',
+    'thinc.structs',
+    'thinc.typedefs',
+    'thinc.linear.avgtron',
+    'thinc.linear.features',
+    'thinc.linear.serialize',
+    'thinc.linear.sparse',
+    'thinc.extra.eg',
+    'thinc.extra.search',
+    'thinc.extra.cache',
+    'thinc.neural.nn',
+    'thinc.neural.solve',
+    'thinc.neural.forward',
+    'thinc.neural.backward',
+    'thinc.neural.tests._funcs_shim',
+    'thinc.neural.tests._backprop_shim',
+]
 
 
-def name_to_path(mod_name, ext):
-    return '%s.%s' % (mod_name.replace('.', '/'), ext)
+compile_options =  {'msvc'  : ['/Ox', '/EHsc'],
+                    'other' : ['-O3', '-Wno-strict-prototypes', '-Wno-unused-function']}
+link_options    =  {'msvc'  : [],
+                    'other' : []}
+
+# By subclassing build_extensions we have the actual compiler that will be used which is really known only after finalize_options
+# http://stackoverflow.com/questions/724664/python-distutils-how-to-get-a-compiler-that-is-going-to-be-used
+class build_ext_options:
+    def build_options(self):
+        for e in self.extensions:
+            e.extra_compile_args = compile_options.get(
+                self.compiler.compiler_type, compile_options['other'])
+        for e in self.extensions:
+            e.extra_link_args = link_options.get(
+                self.compiler.compiler_type, link_options['other'])
 
 
-def c_ext(mod_name, language, includes, compile_args):
-    mod_path = name_to_path(mod_name, language)
-    return Extension(mod_name, [mod_path], include_dirs=includes,
-                     extra_compile_args=compile_args, extra_link_args=compile_args)
+class build_ext_subclass(build_ext, build_ext_options):
+    def build_extensions(self):
+        build_ext_options.build_options(self)
+        build_ext.build_extensions(self)
 
 
-def cython_ext(mod_name, language, includes, compile_args):
-    import Cython.Distutils
-    import Cython.Build
-    mod_path = mod_name.replace('.', '/') + '.pyx'
-    if language == 'cpp':
-        language = 'c++'
-    ext = Extension(mod_name, [mod_path], language=language, include_dirs=includes,
-                    extra_compile_args=compile_args)
-    return Cython.Build.cythonize([ext])[0]
+def generate_cython(root, source):
+    print('Cythonizing sources')
+    p = subprocess.call([sys.executable,
+                         os.path.join(root, 'bin', 'cythonize.py'),
+                         source])
+    if p != 0:
+        raise RuntimeError('Running cythonize failed')
 
 
-def run_setup(exts):
-    setup(
-        name='thinc',
-        packages=['thinc'],
-        version='4.0.0',
-        description="Learn sparse linear models",
-        author='Matthew Honnibal',
-        author_email='honnibal@gmail.com',
-        url="http://github.com/honnibal/thinc",
-        package_data={"thinc": ["*.pyx", "*.pxd", "*.pxi"]},
-        ext_modules=exts,
-        install_requires=["murmurhash", "cymem == 1.30", "preshed == 0.44"],
-        setup_requires=["headers_workaround"],
-        license="MIT",
-    )
-
-    import headers_workaround
-
-    headers_workaround.fix_venv_pypy_include()
-    headers_workaround.install_headers('murmurhash')
+def is_source_release(path):
+    return os.path.exists(os.path.join(path, 'PKG-INFO'))
 
 
-def main(modules, use_cython):
-    language = "cpp"
-    ext_func = cython_ext if use_cython else c_ext
-    includes = ['.', path.join(sys.prefix, 'include')]
-    compile_args = ['-O3']
-    exts = [ext_func(mn, language, includes, compile_args) for mn in modules]
-    run_setup(exts)
+def clean(path):
+    for name in MOD_NAMES:
+        name = name.replace('.', '/')
+        for ext in ['.so', '.html', '.cpp', '.c']:
+            file_path = os.path.join(path, name + ext)
+            if os.path.exists(file_path):
+                os.unlink(file_path)
 
 
-MOD_NAMES = ['thinc.api', "thinc.features", "thinc.model", "thinc.update",
-             'thinc.sparse', 'thinc.search', 'thinc.cache', 'tests.c_test_search']
+@contextlib.contextmanager
+def chdir(new_dir):
+    old_dir = os.getcwd()
+    try:
+        os.chdir(new_dir)
+        sys.path.insert(0, new_dir)
+        yield
+    finally:
+        del sys.path[0]
+        os.chdir(old_dir)
+
+
+def setup_package():
+    root = os.path.abspath(os.path.dirname(__file__))
+
+    if len(sys.argv) > 1 and sys.argv[1] == 'clean':
+        return clean(root)
+
+    with chdir(root):
+        with open(os.path.join(root, 'thinc', 'about.py')) as f:
+            about = {}
+            exec(f.read(), about)
+
+        with open(os.path.join(root, 'README.rst')) as f:
+            readme = f.read()
+
+        include_dirs = [
+            get_python_inc(plat_specific=True),
+            os.path.join(root, 'include')]
+
+        if (ccompiler.new_compiler().compiler_type == 'msvc'
+            and msvccompiler.get_build_version() == 9):
+            include_dirs.append(os.path.join(root, 'include', 'msvc9'))
+
+        ext_modules = []
+        for mod_name in MOD_NAMES:
+            mod_path = mod_name.replace('.', '/') + '.cpp'
+            ext_modules.append(
+                Extension(mod_name, [mod_path],
+                    language='c++', include_dirs=include_dirs))
+
+        if not is_source_release(root):
+            generate_cython(root, 'thinc')
+
+        setup(
+            name=about['__title__'],
+            zip_safe=False,
+            packages=PACKAGES,
+            package_data={'': ['*.pyx', '*.pxd', '*.pxi']},
+            description=about['__summary__'],
+            long_description=readme,
+            author=about['__author__'],
+            author_email=about['__email__'],
+            version=about['__version__'],
+            url=about['__uri__'],
+            license=about['__license__'],
+            ext_modules=ext_modules,
+            install_requires=[
+                'numpy>=1.7',
+                'murmurhash>=0.26,<0.27',
+                'cymem>=1.30,<1.32',
+                'preshed>=0.46,<0.47'],
+            classifiers=[
+                'Development Status :: 5 - Production/Stable',
+                'Environment :: Console',
+                'Intended Audience :: Developers',
+                'Intended Audience :: Science/Research',
+                'License :: OSI Approved :: MIT License',
+                'Operating System :: POSIX :: Linux',
+                'Operating System :: MacOS :: MacOS X',
+                'Operating System :: Microsoft :: Windows',
+                'Programming Language :: Cython',
+                'Programming Language :: Python :: 2.6',
+                'Programming Language :: Python :: 2.7',
+                'Programming Language :: Python :: 3.3',
+                'Programming Language :: Python :: 3.4',
+                'Programming Language :: Python :: 3.5',
+                'Topic :: Scientific/Engineering'],
+            cmdclass = {
+                'build_ext': build_ext_subclass},
+        )
 
 
 if __name__ == '__main__':
-    use_cython = sys.argv[1] == 'build_ext'
-    main(MOD_NAMES, use_cython)
+    setup_package()

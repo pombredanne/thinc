@@ -11,3 +11,7 @@ ctypedef uint64_t hash_t
 ctypedef int32_t class_t
 ctypedef uint32_t count_t
 ctypedef uint32_t time_t
+ctypedef int32_t len_t
+ctypedef int32_t idx_t
+
+

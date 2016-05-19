@@ -15,9 +15,7 @@ def dev():
         local('virtualenv .denv')
  
     with virtualenv(DEV_ENV_DIR):
-        local('pip install cython')
-        local('pip install murmurhash')
-        local('pip install -r dev_requirements.txt')
+        local('pip install -r requirements.txt')
 
 
 
@@ -29,8 +27,12 @@ def sdist():
         local('python setup.py sdist')
 
 
-def publish():
+def publish(version):
     with virtualenv(VENV_DIR):
+        local('git push origin master')
+        local('git tag -a %s' % version)
+        local('git push origin %s' % version)
+        local('python setup.py sdist')
         local('python setup.py register')
         local('twine upload dist/*.tar.gz')
 
@@ -51,7 +53,7 @@ def install():
 def make():
     with virtualenv(VENV_DIR):
         with lcd(path.dirname(__file__)):
-            local('python setup.py build_ext --inplace')
+            local('python setup.py build')
 
 
 def clean():
@@ -62,8 +64,8 @@ def clean():
 def test():
     with virtualenv(VENV_DIR):
         with lcd(path.dirname(__file__)):
-            local('py.test -x')
+            local('python -m pytest -x thinc')
 
 
 def travis():
-    local('open https://travis-ci.org/honnibal/thinc')
+    local('open https://travis-ci.org/spacy-io/thinc')
